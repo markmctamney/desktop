@@ -14,11 +14,9 @@ import {
   isRepositoryWithGitHubRepository,
 } from '../../models/repository'
 import { Button } from '../lib/button'
-import { Avatar } from '../lib/avatar'
 import { Loading } from '../lib/loading'
 import { AuthorInput } from '../lib/author-input'
 import { FocusContainer } from '../lib/focus-container'
-import { showContextualMenu } from '../main-process-proxy'
 import { Octicon, OcticonSymbol } from '../octicons'
 import { IAuthor } from '../../models/author'
 import { IMenuItem } from '../../lib/menu-item'
@@ -28,6 +26,15 @@ import { PermissionsCommitWarning } from './permissions-commit-warning'
 import { LinkButton } from '../lib/link-button'
 import { FoldoutType } from '../../lib/app-state'
 import { IAvatarUser, getAvatarUserFromAuthor } from '../../models/avatar'
+import { showContextualMenu } from '../main-process-proxy'
+import { Account } from '../../models/account'
+import { CommitMessageAvatar } from './commit-message-avatar'
+import { getDotComAPIEndpoint } from '../../lib/api'
+import { lookupPreferredEmail } from '../../lib/email'
+import { setGlobalConfigValue } from '../../lib/git/config'
+import { PopupType } from '../../models/popup'
+import { RepositorySettingsTab } from '../repository-settings/repository-settings'
+import { isAccountEmail } from '../../lib/is-account-email'
 
 const addAuthorIcon = new OcticonSymbol(
   18,
@@ -44,13 +51,14 @@ interface ICommitMessageProps {
   readonly onCreateCommit: (context: ICommitContext) => Promise<boolean>
   readonly branch: string | null
   readonly commitAuthor: CommitIdentity | null
-  readonly anyFilesSelected: boolean
+  readonly anyFilesSelected?: boolean
   readonly focusCommitMessage: boolean
   readonly commitMessage: ICommitMessage | null
   readonly repository: Repository
+  readonly repositoryAccount?: Account | null
   readonly dispatcher: Dispatcher
   readonly autocompletionProviders: ReadonlyArray<IAutocompletionProvider<any>>
-  readonly isCommitting: boolean
+  readonly isCommitting?: boolean
   readonly placeholder: string
   readonly prepopulateCommitSummary: boolean
   readonly showBranchProtected: boolean
@@ -72,7 +80,12 @@ interface ICommitMessageProps {
   readonly coAuthors: ReadonlyArray<IAuthor>
 
   /** Whether this component should show its onboarding tutorial nudge arrow */
-  readonly shouldNudge: boolean
+  readonly shouldNudge?: boolean
+
+  readonly commitSpellcheckEnabled: boolean
+
+  /** Optional text to override default commit button text */
+  readonly commitButtonText?: string
 }
 
 interface ICommitMessageState {
@@ -112,9 +125,10 @@ export class CommitMessage extends React.Component<
   private descriptionTextArea: HTMLTextAreaElement | null = null
   private descriptionTextAreaScrollDebounceId: number | null = null
 
+  private coAuthorInputRef = React.createRef<AuthorInput>()
+
   public constructor(props: ICommitMessageProps) {
     super(props)
-
     const { commitMessage } = this.props
 
     this.state = {
@@ -172,6 +186,14 @@ export class CommitMessage extends React.Component<
 
     if (this.props.focusCommitMessage) {
       this.focusSummary()
+    } else if (
+      prevProps.showCoAuthoredBy === false &&
+      this.isCoAuthorInputVisible &&
+      // The co-author input could be also shown when switching between repos,
+      // but in that case we don't want to give the focus to the input.
+      prevProps.repository.id === this.props.repository.id
+    ) {
+      this.coAuthorInputRef.current?.focus()
     }
   }
 
@@ -240,7 +262,7 @@ export class CommitMessage extends React.Component<
 
   private canCommit(): boolean {
     return (
-      (this.props.anyFilesSelected && this.state.summary.length > 0) ||
+      (this.props.anyFilesSelected === true && this.state.summary.length > 0) ||
       this.props.prepopulateCommitSummary
     )
   }
@@ -268,7 +290,48 @@ export class CommitMessage extends React.Component<
         ? getAvatarUserFromAuthor(commitAuthor, gitHubRepository)
         : undefined
 
-    return <Avatar user={avatarUser} title={avatarTitle} />
+    const repositoryAccount = this.props.repositoryAccount
+    const accountEmails = repositoryAccount?.emails.map(e => e.email) ?? []
+    const email = commitAuthor?.email
+
+    const warningBadgeVisible =
+      email !== undefined &&
+      repositoryAccount !== null &&
+      repositoryAccount !== undefined &&
+      isAccountEmail(accountEmails, email) === false
+
+    return (
+      <CommitMessageAvatar
+        user={avatarUser}
+        title={avatarTitle}
+        email={commitAuthor?.email}
+        isEnterpriseAccount={
+          repositoryAccount?.endpoint !== getDotComAPIEndpoint()
+        }
+        warningBadgeVisible={warningBadgeVisible}
+        accountEmails={accountEmails}
+        preferredAccountEmail={
+          repositoryAccount !== null && repositoryAccount !== undefined
+            ? lookupPreferredEmail(repositoryAccount)
+            : ''
+        }
+        onUpdateEmail={this.onUpdateUserEmail}
+        onOpenRepositorySettings={this.onOpenRepositorySettings}
+      />
+    )
+  }
+
+  private onUpdateUserEmail = async (email: string) => {
+    await setGlobalConfigValue('user.email', email)
+    this.props.dispatcher.refreshAuthor(this.props.repository)
+  }
+
+  private onOpenRepositorySettings = () => {
+    this.props.dispatcher.showPopup({
+      type: PopupType.RepositorySettings,
+      repository: this.props.repository,
+      initialSelectedTab: RepositorySettingsTab.GitConfig,
+    })
   }
 
   private get isCoAuthorInputEnabled() {
@@ -296,10 +359,11 @@ export class CommitMessage extends React.Component<
 
     return (
       <AuthorInput
+        ref={this.coAuthorInputRef}
         onAuthorsUpdated={this.onCoAuthorsUpdated}
         authors={this.props.coAuthors}
         autoCompleteProvider={autocompletionProvider}
-        disabled={this.props.isCommitting}
+        disabled={this.props.isCommitting === true}
       />
     )
   }
@@ -327,31 +391,50 @@ export class CommitMessage extends React.Component<
       action: this.onToggleCoAuthors,
       enabled:
         this.props.repository.gitHubRepository !== null &&
-        !this.props.isCommitting,
+        this.props.isCommitting !== true,
     }
   }
 
-  private onContextMenu = (event: React.MouseEvent<any>) => {
-    if (event.defaultPrevented) {
+  private onContextMenu = (event: React.MouseEvent<HTMLDivElement>) => {
+    if (
+      event.target instanceof HTMLTextAreaElement ||
+      event.target instanceof HTMLInputElement
+    ) {
       return
     }
 
-    event.preventDefault()
-
-    const items: IMenuItem[] = [this.getAddRemoveCoAuthorsMenuItem()]
-    showContextualMenu(items)
+    showContextualMenu([this.getAddRemoveCoAuthorsMenuItem()])
   }
 
-  private onAutocompletingInputContextMenu = (event: React.MouseEvent<any>) => {
-    event.preventDefault()
-
+  private onAutocompletingInputContextMenu = () => {
     const items: IMenuItem[] = [
       this.getAddRemoveCoAuthorsMenuItem(),
       { type: 'separator' },
       { role: 'editMenu' },
+      { type: 'separator' },
     ]
 
-    showContextualMenu(items)
+    items.push(
+      this.getCommitSpellcheckEnabilityMenuItem(
+        this.props.commitSpellcheckEnabled
+      )
+    )
+
+    showContextualMenu(items, true)
+  }
+
+  private getCommitSpellcheckEnabilityMenuItem(isEnabled: boolean): IMenuItem {
+    const enableLabel = __DARWIN__
+      ? 'Enable Commit Spellcheck'
+      : 'Enable commit spellcheck'
+    const disableLabel = __DARWIN__
+      ? 'Disable Commit Spellcheck'
+      : 'Disable commit spellcheck'
+    return {
+      label: isEnabled ? disableLabel : enableLabel,
+      action: () =>
+        this.props.dispatcher.setCommitSpellcheckEnabled(!isEnabled),
+    }
   }
 
   private onCoAuthorToggleButtonClick = (
@@ -372,7 +455,7 @@ export class CommitMessage extends React.Component<
         onClick={this.onCoAuthorToggleButtonClick}
         tabIndex={-1}
         aria-label={this.toggleCoAuthorsText}
-        disabled={this.props.isCommitting}
+        disabled={this.props.isCommitting === true}
       >
         <Octicon symbol={addAuthorIcon} />
       </button>
@@ -438,7 +521,7 @@ export class CommitMessage extends React.Component<
     }
 
     const className = classNames('action-bar', {
-      disabled: this.props.isCommitting,
+      disabled: this.props.isCommitting === true,
     })
 
     return <div className={className}>{this.renderCoAuthorToggleButton()}</div>
@@ -493,12 +576,51 @@ export class CommitMessage extends React.Component<
     }
   }
 
-  public render() {
+  private renderSubmitButton() {
+    const { isCommitting } = this.props
     const isSummaryWhiteSpace = this.state.summary.match(/^\s+$/g)
     const buttonEnabled =
-      this.canCommit() && !this.props.isCommitting && !isSummaryWhiteSpace
+      this.canCommit() && isCommitting !== true && !isSummaryWhiteSpace
 
-    const loading = this.props.isCommitting ? <Loading /> : undefined
+    return (
+      <Button
+        type="submit"
+        className="commit-button"
+        onClick={this.onSubmit}
+        disabled={!buttonEnabled}
+      >
+        {this.renderButtonContents()}
+      </Button>
+    )
+  }
+
+  private renderButtonContents(): JSX.Element {
+    const { isCommitting, branch: branchName, commitButtonText } = this.props
+
+    const loading = isCommitting === true ? <Loading /> : undefined
+    const commitVerb = loading ? 'Committing' : 'Commit'
+    const commitTitle =
+      branchName !== null ? `${commitVerb} to ${branchName}` : commitVerb
+    const defaultContents =
+      branchName !== null ? (
+        <>
+          {commitVerb} to <strong>{branchName}</strong>
+        </>
+      ) : (
+        commitVerb
+      )
+
+    const commitButton = commitButtonText ? commitButtonText : defaultContents
+
+    return (
+      <>
+        {loading}
+        <span title={commitTitle}>{commitButton}</span>
+      </>
+    )
+  }
+
+  public render() {
     const className = classNames({
       'with-action-bar': this.isActionBarEnabled,
       'with-co-authors': this.isCoAuthorInputVisible,
@@ -509,21 +631,8 @@ export class CommitMessage extends React.Component<
     })
 
     const summaryInputClassName = classNames('summary-field', 'nudge-arrow', {
-      'nudge-arrow-left': this.props.shouldNudge,
+      'nudge-arrow-left': this.props.shouldNudge === true,
     })
-
-    const branchName = this.props.branch
-    const commitVerb = loading ? 'Committing' : 'Commit'
-    const commitTitle =
-      branchName !== null ? `${commitVerb} to ${branchName}` : commitVerb
-    const commitButtonContents =
-      branchName !== null ? (
-        <>
-          {commitVerb} to <strong>{branchName}</strong>
-        </>
-      ) : (
-        commitVerb
-      )
 
     return (
       <div
@@ -546,7 +655,8 @@ export class CommitMessage extends React.Component<
             onElementRef={this.onSummaryInputRef}
             autocompletionProviders={this.props.autocompletionProviders}
             onContextMenu={this.onAutocompletingInputContextMenu}
-            disabled={this.props.isCommitting}
+            disabled={this.props.isCommitting === true}
+            spellcheck={this.props.commitSpellcheckEnabled}
           />
         </div>
 
@@ -563,7 +673,8 @@ export class CommitMessage extends React.Component<
             ref={this.onDescriptionFieldRef}
             onElementRef={this.onDescriptionTextAreaRef}
             onContextMenu={this.onAutocompletingInputContextMenu}
-            disabled={this.props.isCommitting}
+            disabled={this.props.isCommitting === true}
+            spellcheck={this.props.commitSpellcheckEnabled}
           />
           {this.renderActionBar()}
         </FocusContainer>
@@ -572,15 +683,7 @@ export class CommitMessage extends React.Component<
 
         {this.renderPermissionsCommitWarning()}
 
-        <Button
-          type="submit"
-          className="commit-button"
-          onClick={this.onSubmit}
-          disabled={!buttonEnabled}
-        >
-          {loading}
-          <span title={commitTitle}>{commitButtonContents}</span>
-        </Button>
+        {this.renderSubmitButton()}
       </div>
     )
   }

@@ -7,7 +7,7 @@ import { ComputedAction } from '../../models/computed-action'
 
 import { IMatches } from '../../lib/fuzzy-find'
 import { truncateWithEllipsis } from '../../lib/truncate-with-ellipsis'
-import { getCommitsInRange, getMergeBase } from '../../lib/git'
+import { getCommitsBetweenCommits, getMergeBase } from '../../lib/git'
 
 import { ActionStatusIcon } from '../lib/action-status-icon'
 
@@ -73,7 +73,7 @@ interface IChooseBranchDialogState {
   readonly filterText: string
 }
 
-/** A component for initating a rebase of the current branch. */
+/** A component for initiating a rebase of the current branch. */
 export class ChooseBranchDialog extends React.Component<
   IChooseBranchDialogProps,
   IChooseBranchDialogState
@@ -126,7 +126,7 @@ export class ChooseBranchDialog extends React.Component<
     })
 
     const { commits, base } = await promiseWithMinimumTimeout(async () => {
-      const commits = await getCommitsInRange(
+      const commits = await getCommitsBetweenCommits(
         repository,
         baseBranch.tip.sha,
         targetBranch.tip.sha

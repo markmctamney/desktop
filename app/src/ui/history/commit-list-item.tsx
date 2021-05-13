@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { Commit } from '../../models/commit'
+import { Commit, CommitOneLine } from '../../models/commit'
 import { GitHubRepository } from '../../models/github-repository'
 import { IAvatarUser, getAvatarUsersForCommit } from '../../models/avatar'
 import { RichText } from '../lib/rich-text'
@@ -11,23 +11,29 @@ import { CommitAttribution } from '../lib/commit-attribution'
 import { AvatarStack } from '../lib/avatar-stack'
 import { IMenuItem } from '../../lib/menu-item'
 import { Octicon, OcticonSymbol } from '../octicons'
-import {
-  enableGitTagsDisplay,
-  enableGitTagsCreation,
-} from '../../lib/feature-flag'
+import { Draggable } from '../lib/draggable'
+import { enableBranchFromCommit } from '../../lib/feature-flag'
 
 interface ICommitProps {
   readonly gitHubRepository: GitHubRepository | null
   readonly commit: Commit
+  readonly selectedCommits: ReadonlyArray<Commit>
   readonly emoji: Map<string, string>
   readonly isLocal: boolean
   readonly onRevertCommit?: (commit: Commit) => void
   readonly onViewCommitOnGitHub?: (sha: string) => void
+  readonly onCreateBranch?: (commit: CommitOneLine) => void
   readonly onCreateTag?: (targetCommitSha: string) => void
   readonly onDeleteTag?: (tagName: string) => void
+  readonly onCherryPick?: (commits: ReadonlyArray<CommitOneLine>) => void
+  readonly onDragStart?: (commits: ReadonlyArray<CommitOneLine>) => void
+  readonly onDragEnd?: (clearCherryPickingState: boolean) => void
+  readonly onRenderCherryPickCommitDragElement?: (commit: Commit) => void
+  readonly onRemoveCherryPickDragElement?: () => void
   readonly showUnpushedIndicator: boolean
   readonly unpushedIndicatorTitle?: string
   readonly unpushedTags?: ReadonlyArray<string>
+  readonly isCherryPickInProgress?: boolean
 }
 
 interface ICommitListItemState {
@@ -62,41 +68,50 @@ export class CommitListItem extends React.PureComponent<
   }
 
   public render() {
-    const commit = this.props.commit
+    const { commit } = this.props
     const {
       author: { date },
     } = commit
 
+    const dragHandlerExists = this.props.onDragStart !== undefined
+    const isDraggable = dragHandlerExists && this.canCherryPick()
+
     return (
-      <div className="commit" onContextMenu={this.onContextMenu}>
-        <div className="info">
-          <RichText
-            className="summary"
-            emoji={this.props.emoji}
-            text={commit.summary}
-            renderUrlsAsLinks={false}
-          />
-          <div className="description">
-            <AvatarStack users={this.state.avatarUsers} />
-            <div className="byline">
-              <CommitAttribution
-                gitHubRepository={this.props.gitHubRepository}
-                commit={commit}
-              />
-              {renderRelativeTime(date)}
+      <Draggable
+        isEnabled={isDraggable}
+        onDragStart={this.onDragStart}
+        onDragEnd={this.onDragEnd}
+        onRenderDragElement={this.onRenderCherryPickCommitDragElement}
+        onRemoveDragElement={this.onRemoveDragElement}
+        dropTargetSelectors={['.branches-list-item', '.pull-request-item']}
+      >
+        <div className="commit" onContextMenu={this.onContextMenu}>
+          <div className="info">
+            <RichText
+              className="summary"
+              emoji={this.props.emoji}
+              text={commit.summary}
+              renderUrlsAsLinks={false}
+            />
+            <div className="description">
+              <AvatarStack users={this.state.avatarUsers} />
+              <div className="byline">
+                <CommitAttribution
+                  gitHubRepository={this.props.gitHubRepository}
+                  commit={commit}
+                />
+                {renderRelativeTime(date)}
+              </div>
             </div>
           </div>
+          {this.renderCommitIndicators()}
         </div>
-        {this.renderCommitIndicators()}
-      </div>
+      </Draggable>
     )
   }
 
   private renderCommitIndicators() {
-    const tagIndicator = enableGitTagsDisplay()
-      ? renderCommitListItemTags(this.props.commit.tags)
-      : null
-
+    const tagIndicator = renderCommitListItemTags(this.props.commit.tags)
     const unpushedIndicator = this.renderUnpushedIndicator()
 
     if (tagIndicator || unpushedIndicator) {
@@ -142,9 +157,26 @@ export class CommitListItem extends React.PureComponent<
     }
   }
 
+  private onCherryPick = () => {
+    if (this.props.onCherryPick !== undefined) {
+      this.props.onCherryPick(this.props.selectedCommits)
+    }
+  }
+
   private onContextMenu = (event: React.MouseEvent<any>) => {
     event.preventDefault()
 
+    let items: IMenuItem[] = []
+    if (this.props.selectedCommits.length > 1) {
+      items = this.getContextMenuMultipleCommits()
+    } else {
+      items = this.getContextMenuForSingleCommit()
+    }
+
+    showContextualMenu(items)
+  }
+
+  private getContextMenuForSingleCommit(): IMenuItem[] {
     let viewOnGitHubLabel = 'View on GitHub'
     const gitHubRepository = this.props.gitHubRepository
 
@@ -157,7 +189,9 @@ export class CommitListItem extends React.PureComponent<
 
     const items: IMenuItem[] = [
       {
-        label: __DARWIN__ ? 'Revert this Commit' : 'Revert this commit',
+        label: __DARWIN__
+          ? 'Revert Changes in Commit'
+          : 'Revert changes in commit',
         action: () => {
           if (this.props.onRevertCommit) {
             this.props.onRevertCommit(this.props.commit)
@@ -167,24 +201,41 @@ export class CommitListItem extends React.PureComponent<
       },
     ]
 
-    if (enableGitTagsCreation()) {
+    if (enableBranchFromCommit()) {
       items.push({
-        label: 'Create Tag…',
-        action: this.onCreateTag,
-        enabled: this.props.onCreateTag !== undefined,
+        label: __DARWIN__
+          ? 'Create Branch from Commit'
+          : 'Create branch from commit',
+        action: () => {
+          if (this.props.onCreateBranch) {
+            this.props.onCreateBranch(this.props.commit)
+          }
+        },
       })
-
-      const deleteTagsMenuItem = this.getDeleteTagsMenuItem()
-
-      if (deleteTagsMenuItem !== null) {
-        items.push(
-          {
-            type: 'separator',
-          },
-          deleteTagsMenuItem
-        )
-      }
     }
+
+    items.push({
+      label: 'Create Tag…',
+      action: this.onCreateTag,
+      enabled: this.props.onCreateTag !== undefined,
+    })
+
+    const deleteTagsMenuItem = this.getDeleteTagsMenuItem()
+
+    if (deleteTagsMenuItem !== null) {
+      items.push(
+        {
+          type: 'separator',
+        },
+        deleteTagsMenuItem
+      )
+    }
+
+    items.push({
+      label: __DARWIN__ ? 'Cherry-pick Commit…' : 'Cherry-pick commit…',
+      action: this.onCherryPick,
+      enabled: this.canCherryPick(),
+    })
 
     items.push(
       { type: 'separator' },
@@ -199,7 +250,27 @@ export class CommitListItem extends React.PureComponent<
       }
     )
 
-    showContextualMenu(items)
+    return items
+  }
+
+  private getContextMenuMultipleCommits(): IMenuItem[] {
+    const items: IMenuItem[] = []
+
+    const count = this.props.selectedCommits.length
+    items.push({
+      label: __DARWIN__
+        ? `Cherry-pick ${count} Commits…`
+        : `Cherry-pick ${count} commits…`,
+      action: this.onCherryPick,
+      enabled: this.canCherryPick(),
+    })
+
+    return items
+  }
+
+  private canCherryPick(): boolean {
+    const { onCherryPick, isCherryPickInProgress } = this.props
+    return onCherryPick !== undefined && isCherryPickInProgress === false
   }
 
   private getDeleteTagsMenuItem(): IMenuItem | null {
@@ -235,6 +306,36 @@ export class CommitListItem extends React.PureComponent<
           enabled: unpushedTagsSet.has(tagName),
         }
       }),
+    }
+  }
+
+  private onDragStart = () => {
+    // Removes active status from commit selection so they do not appear
+    // highlighted in commit list.
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur()
+    }
+
+    if (this.props.onDragStart !== undefined) {
+      this.props.onDragStart(this.props.selectedCommits)
+    }
+  }
+
+  private onDragEnd = (isOverDragTarget: boolean): void => {
+    if (this.props.onDragEnd !== undefined) {
+      this.props.onDragEnd(!isOverDragTarget)
+    }
+  }
+
+  private onRenderCherryPickCommitDragElement = () => {
+    if (this.props.onRenderCherryPickCommitDragElement !== undefined) {
+      this.props.onRenderCherryPickCommitDragElement(this.props.commit)
+    }
+  }
+
+  private onRemoveDragElement = () => {
+    if (this.props.onRemoveCherryPickDragElement !== undefined) {
+      this.props.onRemoveCherryPickDragElement()
     }
   }
 }

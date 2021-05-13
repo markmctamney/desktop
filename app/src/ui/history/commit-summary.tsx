@@ -9,10 +9,10 @@ import { Commit } from '../../models/commit'
 import { getAvatarUsersForCommit, IAvatarUser } from '../../models/avatar'
 import { AvatarStack } from '../lib/avatar-stack'
 import { CommitAttribution } from '../lib/commit-attribution'
-import { Checkbox, CheckboxValue } from '../lib/checkbox'
-import { enableGitTagsDisplay } from '../../lib/feature-flag'
 import { Tokenizer, TokenResult } from '../../lib/text-token-parser'
 import { wrapRichTextCommitMessage } from '../../lib/wrap-rich-text-commit-message'
+import { DiffOptions } from '../diff/diff-options'
+import { RepositorySectionTab } from '../../lib/app-state'
 
 interface ICommitSummaryProps {
   readonly repository: Repository
@@ -36,7 +36,16 @@ interface ICommitSummaryProps {
   readonly hideDescriptionBorder: boolean
 
   readonly hideWhitespaceInDiff: boolean
-  readonly onHideWhitespaceInDiffChanged: (checked: boolean) => void
+
+  /** Whether we should display side by side diffs. */
+  readonly showSideBySideDiff: boolean
+  readonly onHideWhitespaceInDiffChanged: (checked: boolean) => Promise<void>
+
+  /** Called when the user changes the side by side diffs setting. */
+  readonly onShowSideBySideDiffChanged: (checked: boolean) => void
+
+  /** Called when the user opens the diff options popover */
+  readonly onDiffOptionsOpened: () => void
 }
 
 interface ICommitSummaryState {
@@ -141,13 +150,6 @@ export class CommitSummary extends React.Component<
         }
       })
     }
-  }
-
-  private onHideWhitespaceInDiffChanged = (
-    event: React.FormEvent<HTMLInputElement>
-  ) => {
-    const value = event.currentTarget.checked
-    this.props.onHideWhitespaceInDiffChanged(value)
   }
 
   private onResized = () => {
@@ -345,16 +347,19 @@ export class CommitSummary extends React.Component<
 
             <li
               className="commit-summary-meta-item without-truncation"
-              title={filesDescription}
+              title="Diff Options"
             >
-              <Checkbox
-                label="Hide Whitespace"
-                value={
-                  this.props.hideWhitespaceInDiff
-                    ? CheckboxValue.On
-                    : CheckboxValue.Off
+              <DiffOptions
+                sourceTab={RepositorySectionTab.History}
+                hideWhitespaceChanges={this.props.hideWhitespaceInDiff}
+                onHideWhitespaceChangesChanged={
+                  this.props.onHideWhitespaceInDiffChanged
                 }
-                onChange={this.onHideWhitespaceInDiffChanged}
+                showSideBySideDiff={this.props.showSideBySideDiff}
+                onShowSideBySideDiffChanged={
+                  this.props.onShowSideBySideDiffChanged
+                }
+                onDiffOptionsOpened={this.props.onDiffOptionsOpened}
               />
             </li>
           </ul>
@@ -366,10 +371,6 @@ export class CommitSummary extends React.Component<
   }
 
   private renderTags() {
-    if (!enableGitTagsDisplay()) {
-      return null
-    }
-
     const tags = this.props.commit.tags || []
 
     if (tags.length === 0) {

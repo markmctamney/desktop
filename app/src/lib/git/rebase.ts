@@ -30,8 +30,9 @@ import {
 import { stageManualConflictResolution } from './stage'
 import { stageFiles } from './update-index'
 import { getStatus } from './status'
-import { getCommitsInRange } from './rev-list'
+import { getCommitsBetweenCommits } from './rev-list'
 import { Branch } from '../../models/branch'
+import { getCommits } from './log'
 
 /** The app-specific results from attempting to rebase a repository */
 export enum RebaseResult {
@@ -218,7 +219,7 @@ export async function getRebaseSnapshot(
     const percentage = next / last
     const value = formatRebaseValue(percentage)
 
-    const commits = await getCommitsInRange(
+    const commits = await getCommitsBetweenCommits(
       repository,
       baseBranchTip,
       originalBranchTip
@@ -234,7 +235,7 @@ export async function getRebaseSnapshot(
     const hasValidCommit =
       commits.length > 0 &&
       nextCommitIndex >= 0 &&
-      nextCommitIndex <= commits.length
+      nextCommitIndex < commits.length
 
     const currentCommitSummary = hasValidCommit
       ? commits[nextCommitIndex].summary
@@ -368,13 +369,19 @@ export async function rebase(
   let options = baseOptions
 
   if (progressCallback !== undefined) {
-    const commits = await getCommitsInRange(
+    const commits = await getCommitsBetweenCommits(
       repository,
       baseBranch.tip.sha,
       targetBranch.tip.sha
     )
 
     if (commits === null) {
+      // BadRevision can be raised here if git rev-list is unable to resolve a
+      // ref to a commit ID, so we need to signal to the caller that this rebase
+      // is not possible to perform
+      log.warn(
+        'Unable to rebase these branches because one or both of the refs do not exist in the repository'
+      )
       return RebaseResult.Error
     }
 
@@ -427,7 +434,8 @@ export async function continueRebase(
   repository: Repository,
   files: ReadonlyArray<WorkingDirectoryFileChange>,
   manualResolutions: ReadonlyMap<string, ManualConflictResolution> = new Map(),
-  progressCallback?: (progress: IRebaseProgress) => void
+  progressCallback?: (progress: IRebaseProgress) => void,
+  gitEditor: string = ':'
 ): Promise<RebaseResult> {
   const trackedFiles = files.filter(f => {
     return f.status.kind !== AppFileStatusKind.Untracked
@@ -472,7 +480,7 @@ export async function continueRebase(
       GitError.UnresolvedConflicts,
     ]),
     env: {
-      GIT_EDITOR: ':',
+      GIT_EDITOR: gitEditor,
     },
   }
 
@@ -513,6 +521,67 @@ export async function continueRebase(
     ['rebase', '--continue'],
     repository.path,
     'continueRebase',
+    options
+  )
+
+  return parseRebaseResult(result)
+}
+
+/**
+ * Method for initiating interactive rebase in the app.
+ *
+ * In order to modify the interactive todo list during interactive rebase, we
+ * create a temporary todo list of our own. Pass that file's path into our
+ * interactive rebase and using the sequence.editor to cat replace the
+ * interactive todo list with the contents of our generated one.
+ *
+ * @param pathOfGeneratedTodo path to generated todo list for interactive rebase
+ * @param lastRetainedCommitRef the commit before the earliest commit to be changed during the interactive rebase
+ * @param action a description of the action to be displayed in the progress dialog - i.e. Squash, Amend, etc..
+ */
+export async function rebaseInteractive(
+  repository: Repository,
+  pathOfGeneratedTodo: string,
+  lastRetainedCommitRef: string,
+  action: string = 'interactive rebase',
+  gitEditor: string = ':',
+  progressCallback?: (progress: IRebaseProgress) => void
+): Promise<RebaseResult> {
+  const baseOptions: IGitExecutionOptions = {
+    expectedErrors: new Set([GitError.RebaseConflicts]),
+    env: {
+      GIT_EDITOR: gitEditor,
+    },
+  }
+
+  let options = baseOptions
+
+  if (progressCallback !== undefined) {
+    const commits = await getCommits(repository, lastRetainedCommitRef)
+
+    if (commits === null) {
+      log.warn(`Unable to interactively rebase if no commits in revision`)
+      return RebaseResult.Error
+    }
+
+    // TODO: pass in a rebase action for parser - Rebase, Squash, etc..
+    options = configureOptionsForRebase(baseOptions, {
+      commits,
+      progressCallback,
+    })
+  }
+
+  const result = await git(
+    [
+      '-c',
+      // This replaces interactive todo with contents of file at pathOfGeneratedTodo
+      `sequence.editor=cat "${pathOfGeneratedTodo}" >`,
+      'rebase',
+      '-i',
+      lastRetainedCommitRef,
+    ],
+    repository.path,
+    action,
     options
   )
 
