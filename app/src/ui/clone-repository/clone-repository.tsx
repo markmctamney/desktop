@@ -575,6 +575,10 @@ export class CloneRepository extends React.Component<
       newPath = tabState.path
     }
 
+    if (parsed?.owner) {
+      newPath = `${newPath}@${parsed.owner}`
+    }
+
     this.setSelectedTabState(
       {
         url,
